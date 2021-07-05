@@ -136,6 +136,7 @@ struct bq2560x {
 	bool resume_completed;
 
 	bool batt_present;
+	bool usb_online;
 	bool usb_present;
 	int  batt_capacity;
 
@@ -221,7 +222,8 @@ struct bq2560x {
 
 	enum power_supply_type usb_supply_type;
 	struct extcon_dev *extcon;
-	struct regulator	*dpdm_reg;
+	struct regulator *dpdm_reg;
+	bool rm_pulldown;
 };
 
 static int BatteryTestStatus_enable = 0;
@@ -847,7 +849,7 @@ report:
 		case CHARGE_STATE_PRECHG:
 			return POWER_SUPPLY_STATUS_CHARGING;
 		case CHARGE_STATE_CHGDONE:
-			return POWER_SUPPLY_STATUS_FULL;
+			return POWER_SUPPLY_STATUS_NOT_CHARGING;
 		case CHARGE_STATE_IDLE:
 			return POWER_SUPPLY_STATUS_DISCHARGING;
 		default:
@@ -1025,6 +1027,70 @@ static enum power_supply_property bq2560x_usb_properties[] = {
 	POWER_SUPPLY_PROP_SDP_CURRENT_MAX,
 };
 
+static int bq2560x_request_dpdm(struct bq2560x *bq, bool enable)
+{
+	int rc = 0;
+
+	/* fetch the DPDM regulator */
+	if (!bq->dpdm_reg && of_get_property(bq->dev->of_node,
+				"dpdm-supply", NULL)) {
+		bq->dpdm_reg = devm_regulator_get(bq->dev, "dpdm");
+		if (IS_ERR(bq->dpdm_reg)) {
+			rc = PTR_ERR(bq->dpdm_reg);
+			pr_err("Couldn't get dpdm regulator rc=%d\n",
+					rc);
+			bq->dpdm_reg = NULL;
+			return rc;
+		}
+	}
+
+	if (enable) {
+		if (bq->dpdm_reg && !regulator_is_enabled(bq->dpdm_reg)) {
+			pr_err("enabling DPDM regulator\n");
+			rc = regulator_enable(bq->dpdm_reg);
+			if (rc < 0)
+				pr_err("Couldn't enable dpdm regulator rc=%d\n",
+					rc);
+		}
+	} else {
+		if (bq->dpdm_reg && regulator_is_enabled(bq->dpdm_reg)) {
+			pr_err("disabling DPDM regulator\n");
+			rc = regulator_disable(bq->dpdm_reg);
+			if (rc < 0)
+				pr_err("Couldn't disable dpdm regulator rc=%d\n",
+					rc);
+		}
+	}
+
+	if (!rc) {
+		bq->rm_pulldown = enable;
+		pr_info("RM Pulldown %d", bq->rm_pulldown);
+	}
+
+	return rc;
+}
+
+static int bq2560x_otg_pmic_dp_dm(struct bq2560x *bq, int value)
+{
+	int ret = 0;
+
+	switch (value) {
+	case POWER_SUPPLY_DP_DM_DPF_DMF:
+		if (!bq->rm_pulldown)
+			ret = bq2560x_request_dpdm(bq, true);
+		break;
+	case POWER_SUPPLY_DP_DM_DPR_DMR:
+		if (bq->rm_pulldown)
+			ret = bq2560x_request_dpdm(bq, false);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
 static int bq2560x_usb_get_property(struct power_supply *psy,
 				  enum power_supply_property psp,
 				  union power_supply_propval *val)
@@ -1032,27 +1098,24 @@ static int bq2560x_usb_get_property(struct power_supply *psy,
 	struct bq2560x *bq = power_supply_get_drvdata(psy);
 
 	switch (psp) {
-	case POWER_SUPPLY_PROP_SDP_CURRENT_MAX:
-	case POWER_SUPPLY_PROP_CURRENT_MAX:
-		val->intval = bq->usb_psy_ma * 1000;
-		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = bq->usb_present;
 		break;
 	case POWER_SUPPLY_PROP_ONLINE:
-		val->intval = bq->usb_present;
+		val->intval = bq->usb_online;
+		break;
+	case POWER_SUPPLY_PROP_DP_DM:
+		val->intval = bq->rm_pulldown;
 		break;
 	case POWER_SUPPLY_PROP_REAL_TYPE:
-		val->intval = POWER_SUPPLY_TYPE_UNKNOWN;
-		if (bq->usb_present &&
-			(bq->usb_supply_type != POWER_SUPPLY_TYPE_UNKNOWN))
-			val->intval = bq->usb_supply_type;
+		val->intval = bq->usb_supply_type;
 		break;
 	case POWER_SUPPLY_PROP_TYPE:
-		val->intval = POWER_SUPPLY_TYPE_USB;
-		if (bq->usb_present &&
-			(bq->usb_supply_type != POWER_SUPPLY_TYPE_UNKNOWN))
-			val->intval = bq->usb_psy_desc.type;
+		val->intval = bq->usb_psy_desc.type;
+		break;
+	case POWER_SUPPLY_PROP_SDP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		val->intval = bq->usb_psy_ma * 1000;
 		break;
 	default:
 		return -EINVAL;
@@ -1065,16 +1128,35 @@ static int bq2560x_usb_set_property(struct power_supply *psy,
 				  const union power_supply_propval *val)
 {
 	struct bq2560x *bq = power_supply_get_drvdata(psy);
+	int ret;
 
 	switch (psp) {
-	case POWER_SUPPLY_PROP_SDP_CURRENT_MAX:
-	case POWER_SUPPLY_PROP_CURRENT_MAX:
-		bq->usb_psy_ma = val->intval / 1000;
+	case POWER_SUPPLY_PROP_ONLINE:
+		bq->usb_online = val->intval;
+		break;
+	case POWER_SUPPLY_PROP_DP_DM:
+		bq2560x_otg_pmic_dp_dm(bq, val->intval);
 		break;
 	case POWER_SUPPLY_PROP_REAL_TYPE:
 		bq->usb_supply_type = val->intval;
+		/* Set POWER_SUPPLY_PROP_TYPE.
+		 * Don't report UNKNOWN charger type to prevent healthd missing
+		 * detecting this power_supply status change. */
+		if (bq->usb_supply_type == POWER_SUPPLY_TYPE_UNKNOWN)
+			bq->usb_psy_desc.type = POWER_SUPPLY_TYPE_USB;
+		else
+			bq->usb_psy_desc.type = bq->usb_supply_type;
 	case POWER_SUPPLY_PROP_TYPE:
-		bq->usb_psy_desc.type = val->intval;
+		// Don't let others set this.
+		return 0;
+		//bq->usb_psy_desc.type = val->intval;
+		break;
+	case POWER_SUPPLY_PROP_SDP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		bq->usb_psy_ma = val->intval / 1000;
+		ret = bq2560x_set_input_current_limit(bq, bq->usb_psy_ma);
+		if (ret < 0)
+			pr_err("couldn't set input current limit, ret=%d\n", ret);
 		break;
 	default:
 		return -EINVAL;
@@ -1088,6 +1170,7 @@ static int bq2560x_usb_is_writeable(struct power_supply *psy,
 			enum power_supply_property psp)
 {
 	switch (psp) {
+	case POWER_SUPPLY_PROP_SDP_CURRENT_MAX:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return 1;
 	default:
@@ -1164,15 +1247,13 @@ static int bq2560x_update_charging_profile(struct bq2560x *bq)
 		chg_ma = bq->jeita_ma;
 		chg_mv = bq->jeita_mv;
 	} else {
-		if (bq->usb_supply_type == POWER_SUPPLY_TYPE_USB_DCP
-			|| bq->usb_supply_type == POWER_SUPPLY_TYPE_USB_CDP) {
+		if (prop.intval == POWER_SUPPLY_TYPE_USB_DCP
+			|| prop.intval == POWER_SUPPLY_TYPE_USB_CDP) {
 			chg_ma = bq->platform_data->ta.ichg;
 			chg_mv = bq->platform_data->ta.vreg;
-			pr_err("DCP or CDP detected, set max current to : %d, max voltage to : %d\n", chg_ma,chg_mv);
 		} else {
 			chg_ma = bq->platform_data->usb.ichg;
 			chg_mv = bq->platform_data->usb.vreg;
-			pr_err("USB detected, set max current to : %d, max voltage to : %d\n", chg_ma,chg_mv);
 		}
 	}
 	
@@ -1291,8 +1372,7 @@ static void bq2560x_external_power_changed(struct power_supply *psy)
 			pc_suspend = 0;
 			bq2560x_charging_disable(bq, CURRENT, 0);
 		}
-	}
-	else
+	} else
 		bq2560x_update_charging_profile(bq);
 
 	ret = power_supply_get_property(bq->usb_psy, 
@@ -1383,47 +1463,10 @@ static int bq2560x_psy_register(struct bq2560x *bq)
 
 static void bq2560x_psy_unregister(struct bq2560x *bq)
 {
-	power_supply_unregister(bq->batt_psy);
 	power_supply_unregister(bq->usb_psy);
+	power_supply_unregister(bq->batt_psy);
 }
 
-static int bq2560x_request_dpdm(struct bq2560x *bq, bool enable)
-{
-	int rc = 0;
-
-	/* fetch the DPDM regulator */
-	if (!bq->dpdm_reg && of_get_property(bq->dev->of_node,
-				"dpdm-supply", NULL)) {
-		bq->dpdm_reg = devm_regulator_get(bq->dev, "dpdm");
-		if (IS_ERR(bq->dpdm_reg)) {
-			rc = PTR_ERR(bq->dpdm_reg);
-			pr_err("Couldn't get dpdm regulator rc=%d\n",
-					rc);
-			bq->dpdm_reg = NULL;
-			return rc;
-		}
-	}
-
-	if (enable) {
-		if (bq->dpdm_reg && !regulator_is_enabled(bq->dpdm_reg)) {
-			pr_err("enabling DPDM regulator\n");
-			rc = regulator_enable(bq->dpdm_reg);
-			if (rc < 0)
-				pr_err("Couldn't enable dpdm regulator rc=%d\n",
-					rc);
-		}
-	} else {
-		if (bq->dpdm_reg && regulator_is_enabled(bq->dpdm_reg)) {
-			pr_err("disabling DPDM regulator\n");
-			rc = regulator_disable(bq->dpdm_reg);
-			if (rc < 0)
-				pr_err("Couldn't disable dpdm regulator rc=%d\n",
-					rc);
-		}
-	}
-
-	return rc;
-}
 
 static int bq2560x_otg_regulator_enable(struct regulator_dev *rdev)
 {
@@ -1523,6 +1566,80 @@ static int bq2560x_regulator_init(struct bq2560x *bq)
 	return ret;
 }
 
+static int bq2560x_handle_usb_insertion(struct bq2560x *bq)
+{
+	int ret;
+	union power_supply_propval pval = {0, };
+
+	if(!bq->power_good) {
+		pr_err("Power is poor. Exiting.\n");
+		return -EAGAIN;
+	}
+
+	if(bq->usb_present)
+		pr_warn("USB is already present.\n");
+
+	pval.intval = POWER_SUPPLY_DP_DM_DPF_DMF;
+	power_supply_set_property(bq->usb_psy,
+				POWER_SUPPLY_PROP_DP_DM, &pval);
+
+	bq->usb_present = true;
+
+	/*for cdp detect*/
+	msleep(10);
+
+	ret = extcon_set_cable_state_(bq->extcon, EXTCON_USB, bq->usb_present);
+	if (ret < 0)
+		pr_err("Couldn't set extcon cable state to %d, ret=%d\n", bq->usb_present, ret);
+
+	ret = power_supply_set_online(bq->usb_psy, true);
+	if (ret < 0) {
+		pr_err("Couldn't set online status of usb_psy. ret=%d\n", ret);
+		goto err;
+	}
+
+	return 0;
+
+err:
+	return ret;
+}
+
+static int bq2560x_handle_usb_removal(struct bq2560x *bq)
+{
+	int ret;
+	union power_supply_propval pval = {0, };
+
+	if(bq->power_good) {
+		pr_err("Power is good. Exiting.\n");
+		return -EAGAIN;
+	}
+
+	if(!bq->usb_present)
+		pr_warn("USB is not present.\n");
+
+	ret = power_supply_set_online(bq->usb_psy, false);
+	if (ret < 0) {
+		pr_err("Couldn't set online status of usb_psy. ret=%d\n", ret);
+		goto err;
+	}
+
+	ret = extcon_set_cable_state_(bq->extcon, EXTCON_USB, false);
+	if (ret < 0)
+		pr_err("Couldn't set extcon cable state to false, ret=%d\n", ret);
+
+	bq->usb_present = false;
+
+/* TODO: Fix enabling DPDM during resume, get rid of NonDrv error
+	pval.intval = POWER_SUPPLY_DP_DM_DPR_DMR;
+	power_supply_set_property(bq->usb_psy,
+				POWER_SUPPLY_PROP_DP_DM, &pval);
+*/
+
+	return 0;
+
+err:
+	return ret;
+}
 
 static int bq2560x_parse_jeita_dt(struct device *dev, struct bq2560x* bq)
 {
@@ -2167,7 +2284,7 @@ static void bq2560x_update_status(struct bq2560x *bq)
 static irqreturn_t bq2560x_charger_interrupt(int irq, void *dev_id)
 {
 	struct bq2560x *bq = dev_id;
-
+	
 	u8 status;
 	int ret;	
 	
@@ -2195,10 +2312,7 @@ static irqreturn_t bq2560x_charger_interrupt(int irq, void *dev_id)
 
 	if(!bq->power_good) {
 	    if(bq->usb_present) {
-			bq->usb_present = false;
-			bq->usb_supply_type = POWER_SUPPLY_TYPE_UNKNOWN;
-			extcon_set_cable_state_(bq->extcon, EXTCON_USB, false);
-			/* bq2560x_request_dpdm(bq, false); */
+			bq2560x_handle_usb_removal(bq);
 		}
 
 		if (bq->software_jeita_supported) {
@@ -2212,10 +2326,7 @@ static irqreturn_t bq2560x_charger_interrupt(int irq, void *dev_id)
 
 		pr_err("usb removed, set usb present = %d\n", bq->usb_present);
 	} else if (bq->power_good && !bq->usb_present) {
-		bq->usb_present = true;
-		bq2560x_request_dpdm(bq, true);
-		msleep(10);/*for cdp detect*/
-		extcon_set_cable_state_(bq->extcon, EXTCON_USB, true);
+		bq2560x_handle_usb_insertion(bq);
 
 		cancel_delayed_work(&bq->discharge_jeita_work);
 
@@ -2229,8 +2340,6 @@ static irqreturn_t bq2560x_charger_interrupt(int irq, void *dev_id)
 		pr_err("usb plugged in, set usb present = %d\n", bq->usb_present);
 	}
 	
-	power_supply_changed(bq->usb_psy);
-
 	bq2560x_update_status(bq);
 
 	mutex_unlock(&bq->irq_complete);
@@ -2245,22 +2354,16 @@ static void determine_initial_status(struct bq2560x *bq)
 {
 	int ret;
 	u8 status = 0;
+	union power_supply_propval pval = {0, };
+
 	ret = bq2560x_get_hiz_mode(bq, &status);
 	if (!ret) 
 		bq->in_hiz = !!status;
 
-	if (bq->usb_present)
-		bq2560x_request_dpdm(bq, true);
-
+	pval.intval = POWER_SUPPLY_DP_DM_DPF_DMF;
+	power_supply_set_property(bq->usb_psy,
+				POWER_SUPPLY_PROP_DP_DM, &pval);
 	bq2560x_charger_interrupt(bq->client->irq, bq);
-
-	if(!bq->usb_present) {
-		extcon_set_cable_state_(bq->extcon, EXTCON_USB, false);
-	}
-	else {
-		extcon_set_cable_state_(bq->extcon, EXTCON_USB, true);
-	}
-	power_supply_changed(bq->usb_psy);
 }
 
 
@@ -2426,6 +2529,8 @@ static int bq2560x_charger_probe(struct i2c_client *client,
 		return -ENOMEM;
 	}
 
+	bq->rm_pulldown = 0;
+
 	bq->dev = &client->dev;
 	bq->bms_psy = bms_psy;
 
@@ -2441,26 +2546,6 @@ static int bq2560x_charger_probe(struct i2c_client *client,
 	bq->resume_completed = true;
 	bq->irq_waiting = false;
 	
-	/* extcon registration */
-	bq->extcon = devm_extcon_dev_allocate(bq->dev, bq2560x_extcon_cable);
-	if (IS_ERR(bq->extcon)) {
-		ret = PTR_ERR(bq->extcon);
-		pr_err("failed to allocate extcon device rc=%d\n", ret);
-		goto err_1;
-	}
-
-	ret = devm_extcon_dev_register(bq->dev, bq->extcon);
-	if (ret < 0) {
-		pr_err("failed to register extcon device rc=%d\n", ret);
-		goto err_1;
-	}
-
-	ret = bq2560x_usb_psy_register(bq);
-	if (ret) {
-		pr_err("failed to register usb psy rc=%d\n", ret);
-		goto err_1;
-	}
-
 	ret = bq2560x_detect_device(bq);
 	if(ret) {
 		pr_err("No bq2560x device found!\n");
@@ -2494,10 +2579,31 @@ static int bq2560x_charger_probe(struct i2c_client *client,
 		return ret;
 	}
 
-	
-	ret = bq2560x_psy_register(bq);
-	if (ret)
+	bq->extcon = devm_extcon_dev_allocate(bq->dev, bq2560x_extcon_cable);
+	if (IS_ERR(bq->extcon)) {
+		ret = PTR_ERR(bq->extcon);
+		pr_err("failed to allocate extcon device rc=%d\n", ret);
 		return ret;
+	}
+
+	ret = devm_extcon_dev_register(bq->dev, bq->extcon);
+	if (ret < 0) {
+		pr_err("failed to register extcon device rc=%d\n", ret);
+		return ret;
+	}
+
+	ret = bq2560x_usb_psy_register(bq);
+	if (ret) {
+		pr_err("failed to register usb psy rc=%d\n", ret);
+		return ret;
+	}
+
+	ret = bq2560x_psy_register(bq);
+	if (ret) {
+		pr_err("failed to register psy rc=%d\n", ret);
+		return ret;
+	};
+
 	ret = bq2560x_regulator_init(bq);
 	if (ret) {
 		pr_err("Couldn't initialize bq2560x regulator ret=%d\n", ret);
@@ -2579,7 +2685,6 @@ static int bq2560x_resume(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct bq2560x *bq = i2c_get_clientdata(client);
-
 
 	mutex_lock(&bq->irq_complete);
 	bq->resume_completed = true;
